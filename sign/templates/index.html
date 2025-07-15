@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Sign Language Detector</title>
+  <style>
+    body{margin:0;padding:0;font-family:'Segoe UI',sans-serif;background:#000;color:#fff;
+         display:flex;flex-direction:column;align-items:center;min-height:100vh;padding:20px;}
+    h1{color:#ff4d4d;text-align:center;margin-bottom:20px;text-shadow:0 0 12px rgba(255,0,0,.6);}
+    #video-container{position:relative;width:90%;max-width:600px;backdrop-filter:blur(10px);
+      background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:20px;
+      box-shadow:0 0 20px rgba(255,0,0,.5);overflow:hidden;padding:10px;margin-bottom:20px;
+      transition:transform .3s ease;}
+    #video-container:hover{transform:scale(1.02);box-shadow:0 0 35px rgba(255,0,0,.8);}
+    video{width:100%;height:auto;border-radius:12px;display:block;}
+    canvas.overlay{position:absolute;top:10px;left:10px;pointer-events:none;border-radius:12px;}
+    #instructions{max-width:600px;width:90%;padding:15px 20px;background:rgba(255,255,255,.08);
+      border-left:5px solid #ff3333;border-radius:10px;font-size:1rem;line-height:1.6;color:#ddd;
+      box-shadow:0 0 10px rgba(255,0,0,.3);}    
+    #instructions p{margin:8px 0;}
+    #log{max-width:600px;width:90%;background:rgba(255,255,255,.05);color:#ccc;font-size:1rem;
+      font-family:monospace;padding:10px;margin-top:10px;border-radius:10px;white-space:pre-wrap;
+      text-align:center;}
+    @media(max-width:480px){h1{font-size:1.5rem;}#instructions{font-size:.95rem;padding:12px 16px;}}
+  </style>
+</head>
+<body>
+  <h1>Real-time Sign Language Detection</h1>
+
+  <div id="video-container">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="overlay" class="overlay"></canvas>
+  </div>
+  <div id="log">🔍 Waiting for predictions...</div>
+
+  <div id="instructions">
+    <p>📷 Ensure your webcam is connected and facing your hand clearly.</p>
+    <p>💡 Use bright lighting and a plain background for better detection.</p>
+    <p>🖐️ Hold signs steadily for a short time to let the system recognize them.</p>
+    <p>📲 This page works across desktops, tablets, and mobile screens.</p>
+  </div>
+
+  <script>
+    const video = document.getElementById("video");
+    const overlay = document.getElementById("overlay");
+    const log = document.getElementById("log");
+    const ctxOv = overlay.getContext("2d");
+    let lastDetectionTime = Date.now();
+
+    async function startWebcam() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        video.srcObject = stream;
+      } catch (err) {
+        log.textContent = "🚫 Webcam error: " + err.message;
+      }
+    }
+
+    function resizeCanvas() {
+      overlay.width = video.videoWidth;
+      overlay.height = video.videoHeight;
+    }
+
+    async function captureAndSendFrame() {
+      if (video.readyState < 2) return;
+      resizeCanvas();
+
+      const tempCanvas = document.createElement("canvas");
+      tempCanvas.width = video.videoWidth;
+      tempCanvas.height = video.videoHeight;
+      tempCanvas.getContext("2d").drawImage(video, 0, 0);
+      const dataURL = tempCanvas.toDataURL("image/jpeg");
+
+      try {
+        const res = await fetch("/predict", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ image: dataURL, task: "both" })
+        });
+        const json = await res.json();
+
+        if (json.error) {
+          log.textContent = "❌ Error: " + json.error;
+          ctxOv.clearRect(0, 0, overlay.width, overlay.height);
+          return;
+        }
+
+        const detections = json.detections || [];
+        const segmentations = json.segmentations || [];
+        ctxOv.clearRect(0, 0, overlay.width, overlay.height);
+
+        const labelsForLog = [];
+        // prefer detections: only use segmentations when no detections
+        const useSeg = detections.length === 0 && segmentations.length > 0;
+        const items = useSeg ? segmentations : detections;
+        const color = useSeg ? 'orange' : 'lime';
+        const prefix = useSeg ? '🔶' : '🖐️';
+
+        if (items.length) {
+          lastDetectionTime = Date.now();
+
+          items.forEach(item => {
+            const [x1, y1, x2, y2] = item.bbox;
+            const label = item.label;
+            const conf = Math.round(item.confidence * 100);
+
+            if (useSeg && item.mask) {
+              const maskImg = new Image();
+              maskImg.onload = () => {
+                ctxOv.save();
+                ctxOv.globalAlpha = 0.35;
+                ctxOv.drawImage(maskImg, 0, 0, overlay.width, overlay.height);
+                ctxOv.restore();
+              };
+              maskImg.src = 'data:image/png;base64,' + item.mask;
+            }
+
+            ctxOv.strokeStyle = color;
+            ctxOv.lineWidth = 2;
+            ctxOv.strokeRect(x1, y1, x2 - x1, y2 - y1);
+
+            const text = `${label} ${conf}%`;
+            ctxOv.font = '16px Segoe UI';
+            const textWidth = ctxOv.measureText(text).width + 8;
+            ctxOv.fillStyle = 'rgba(0,0,0,0.6)';
+            ctxOv.fillRect(x1, y1 - 20, textWidth, 20);
+            ctxOv.fillStyle = 'white';
+            ctxOv.fillText(text, x1 + 4, y1 - 4);
+
+            labelsForLog.push(`${label} (${conf}%)`);
+          });
+
+          log.textContent = `${prefix} Detected: ` + labelsForLog.join(', ');
+        } else {
+          const idle = Date.now() - lastDetectionTime;
+          if (idle > 2000) {
+            log.textContent = '🕵️ No signs detected.';
+            ctxOv.clearRect(0, 0, overlay.width, overlay.height);
+          }
+        }
+      } catch (err) {
+        log.textContent = '⚠️ Fetch error: ' + err.message;
+        ctxOv.clearRect(0, 0, overlay.width, overlay.height);
+      }
+    }
+
+    startWebcam().then(() => setInterval(captureAndSendFrame, 600));
+  </script>
+</body>
+</html>
